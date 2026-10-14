@@ -1,0 +1,2058 @@
+#!/usr/bin/python3
+# Sony headphones control for the Omarchy shell.
+#
+# Copyright (C) 2026 Gabriel Aramburu
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# The v1 ("MDR") wire protocol implemented here — payload opcodes, byte layouts
+# and their meaning — was reverse engineered by the Gadgetbridge project
+# (AGPL-3.0-or-later), with the message framing cross-checked against
+# SonyHeadphonesClient (MIT). See README.md for the full attribution.
+#
+# Speaks Sony's RFCOMM protocol directly: no PyBluez, no D-Bus bindings, no
+# vendor app. Everything below is Python's standard library plus bluetoothctl,
+# which ships with bluez-utils.
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import json
+import os
+import re
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+# ---------------------------------------------------------------------------
+# Framing
+# ---------------------------------------------------------------------------
+#
+# <0x3e> ESCAPE(<type><seq><len:4 BE><payload><checksum>) <0x3c>
+#
+# The checksum is a plain byte sum of everything from <type> through the last
+# payload byte. Escaping happens after the checksum is appended, so a checksum
+# that lands on a marker byte gets escaped too.
+
+HEADER = 0x3E
+TRAILER = 0x3C
+ESCAPE = 0x3D
+ESCAPE_MASK = 0xEF
+
+MSG_ACK = 0x01
+MSG_COMMAND_1 = 0x0C
+MSG_COMMAND_2 = 0x0E
+
+MAX_MESSAGE_SIZE = 2048
+
+# Sony's app SPP service. Used to recognise a device that speaks this protocol.
+SERVICE_UUID = "96cc203e-5068-46ad-b32d-e316f5e069ba"
+
+
+class ProtocolError(Exception):
+    """A frame that arrived malformed. Recoverable: drop it and read on."""
+
+
+def escape(data: bytes) -> bytes:
+    out = bytearray()
+    for b in data:
+        if b in (HEADER, TRAILER, ESCAPE):
+            out.append(ESCAPE)
+            out.append(b & ESCAPE_MASK)
+        else:
+            out.append(b)
+    return bytes(out)
+
+
+def unescape(data: bytes) -> bytes:
+    out = bytearray()
+    i = 0
+    while i < len(data):
+        b = data[i]
+        if b == ESCAPE:
+            i += 1
+            if i >= len(data):
+                raise ProtocolError("escape character at end of frame")
+            out.append(data[i] | (~ESCAPE_MASK & 0xFF))
+        else:
+            out.append(b)
+        i += 1
+    return bytes(out)
+
+
+def checksum(data: bytes) -> int:
+    return sum(data) & 0xFF
+
+
+def encode_message(msg_type: int, seq: int, payload: bytes) -> bytes:
+    body = bytes([msg_type, seq]) + len(payload).to_bytes(4, "big") + payload
+    frame = bytes([HEADER]) + escape(body + bytes([checksum(body)])) + bytes([TRAILER])
+    if len(frame) > MAX_MESSAGE_SIZE:
+        raise ProtocolError("message exceeds the maximum bluetooth message size")
+    return frame
+
+
+def decode_message(frame: bytes) -> tuple[int, int, bytes]:
+    """Take a raw frame including markers, return (type, seq, payload)."""
+    if not frame or frame[0] != HEADER or frame[-1] != TRAILER:
+        raise ProtocolError("frame is missing its markers")
+
+    body = unescape(frame[1:-1])
+    if len(body) < 7:
+        raise ProtocolError("frame is shorter than the minimum message size")
+
+    expected = checksum(body[:-1])
+    if body[-1] != expected:
+        raise ProtocolError(f"bad checksum {body[-1]:02x}, expected {expected:02x}")
+
+    length = int.from_bytes(body[2:6], "big")
+    payload = body[6:-1]
+    if length != len(payload):
+        raise ProtocolError(f"declared length {length} but got {len(payload)} bytes")
+
+    return body[0], body[1], payload
+
+
+# ---------------------------------------------------------------------------
+# Payload opcodes (protocol v1, the "MDR" family: WH-1000XM2/XM3/XM4, WF-SP800N…)
+# ---------------------------------------------------------------------------
+
+INIT_REQUEST = 0x00
+INIT_REPLY = 0x01
+FW_VERSION_REQUEST = 0x04
+FW_VERSION_REPLY = 0x05
+BATTERY_GET = 0x10
+BATTERY_RET = 0x11
+BATTERY_NOTIFY = 0x13
+CODEC_GET = 0x18
+CODEC_RET = 0x19
+CODEC_NOTIFY = 0x1B
+POWER_OFF = 0x22
+EQUALIZER_GET = 0x56
+EQUALIZER_RET = 0x57
+EQUALIZER_SET = 0x58
+EQUALIZER_NOTIFY = 0x59
+ASC_GET = 0x66
+ASC_RET = 0x67
+ASC_SET = 0x68
+ASC_NOTIFY = 0x69
+NC_OPTIMIZER_START = 0x84
+NC_OPTIMIZER_STATUS = 0x85
+NC_OPTIMIZER_STATE_GET = 0x86
+NC_OPTIMIZER_STATE_RET = 0x87
+NC_OPTIMIZER_STATE_NOTIFY = 0x89
+TOUCH_GET = 0xD6
+TOUCH_RET = 0xD7
+TOUCH_SET = 0xD8
+TOUCH_NOTIFY = 0xD9
+UPSAMPLING_GET = 0xE6
+UPSAMPLING_RET = 0xE7
+UPSAMPLING_SET = 0xE8
+UPSAMPLING_NOTIFY = 0xE9
+# One multiplexed family covers auto-power-off, pause-when-taken-off,
+# speak-to-chat on/off and the button modes; payload[1] picks which.
+APO_GET = 0xF6
+APO_RET = 0xF7
+APO_SET = 0xF8
+APO_SUB_PAUSE_WHEN_TAKEN_OFF = 0x03
+APO_SUB_AUTO_POWER_OFF = 0x04
+APO_SUB_SPEAK_TO_CHAT = 0x05
+APO_NOTIFY = 0xF9
+STC_CONFIG_GET = 0xFA
+STC_CONFIG_RET = 0xFB
+STC_CONFIG_SET = 0xFC
+STC_CONFIG_NOTIFY = 0xFD
+# COMMAND_2 family.
+VOICE_NOTIFICATIONS_GET = 0x46
+VOICE_NOTIFICATIONS_RET = 0x47
+VOICE_NOTIFICATIONS_SET = 0x48
+VOICE_NOTIFICATIONS_NOTIFY = 0x49
+
+NC_MODES = ("off", "noise-cancelling", "wind-noise-reduction", "ambient-sound")
+ASC_MODE_CODE = {"ambient-sound": 0x00, "wind-noise-reduction": 0x01, "noise-cancelling": 0x02}
+ASC_MODE_FROM_CODE = {v: k for k, v in ASC_MODE_CODE.items()}
+# Without wind noise reduction the mode byte only distinguishes ambient from NC.
+ASC_MODE_CODE_NO_WIND = {"ambient-sound": 0x00, "noise-cancelling": 0x01}
+ASC_MODE_FROM_CODE_NO_WIND = {v: k for k, v in ASC_MODE_CODE_NO_WIND.items()}
+
+MAX_AMBIENT_LEVEL = 20
+
+EQ_PRESETS = {
+    "off": 0x00,
+    "bright": 0x10,
+    "excited": 0x11,
+    "mellow": 0x12,
+    "relaxed": 0x13,
+    "vocal": 0x14,
+    "treble-boost": 0x15,
+    "bass-boost": 0x16,
+    "speech": 0x17,
+    "manual": 0xA0,
+    "custom-1": 0xA1,
+    "custom-2": 0xA2,
+}
+EQ_PRESET_FROM_CODE = {v: k for k, v in EQ_PRESETS.items()}
+
+AUTO_POWER_OFF = {
+    "off": (0x11, 0x00),
+    "5-min": (0x00, 0x00),
+    "30-min": (0x01, 0x01),
+    "1-hour": (0x02, 0x02),
+    "3-hour": (0x03, 0x03),
+    "when-taken-off": (0x10, 0x00),
+}
+AUTO_POWER_OFF_FROM_CODE = {v: k for k, v in AUTO_POWER_OFF.items()}
+
+STC_SENSITIVITY = {"auto": 0x00, "high": 0x01, "low": 0x02}
+STC_SENSITIVITY_FROM_CODE = {v: k for k, v in STC_SENSITIVITY.items()}
+STC_TIMEOUT = {"short": 0x00, "standard": 0x01, "long": 0x02, "off": 0x03}
+STC_TIMEOUT_FROM_CODE = {v: k for k, v in STC_TIMEOUT.items()}
+
+AUDIO_CODECS = {0x00: "unknown", 0x01: "SBC", 0x02: "AAC", 0x10: "LDAC", 0x20: "aptX", 0x21: "aptX HD"}
+
+# What each model actually honours, verified against hardware where the status
+# says so and taken from Gadgetbridge's device coordinators otherwise. Sending a
+# command a model ignores is harmless but leaves a dead control on screen, which
+# is worse than not offering it: a WH-1000XM4 answers "still on" to every
+# attempt at disabling its touch panel, and answers "when taken off" to every
+# auto-power-off timer.
+FEATURE_SETS = {
+    "WH-1000XM4": {
+        "battery", "equalizer", "dsee", "speak-to-chat", "pause-when-taken-off",
+        "voice-notifications", "auto-power-off", "nc-optimizer",
+    },
+    "WH-1000XM3": {
+        "battery", "equalizer", "dsee", "touch-sensor", "voice-notifications",
+        "auto-power-off", "auto-power-off-timer", "nc-optimizer",
+    },
+    "WH-1000XM2": {
+        "battery", "equalizer", "dsee", "nc-optimizer",
+    },
+}
+
+# An unrecognised v1 device gets everything: better to offer a control that
+# turns out to do nothing than to hide one that would have worked.
+ALL_FEATURES = set().union(*FEATURE_SETS.values()) | {"touch-sensor", "auto-power-off-timer"}
+
+
+def features_for(name: str | None) -> list:
+    for model, features in FEATURE_SETS.items():
+        if model.lower() in str(name or "").lower():
+            return sorted(features)
+    return sorted(ALL_FEATURES)
+
+
+BATTERY_SINGLE = 0x00
+BATTERY_DUAL = 0x01
+BATTERY_CASE = 0x02
+
+
+# ---------------------------------------------------------------------------
+# Requests
+# ---------------------------------------------------------------------------
+
+
+def req(payload: bytes, msg_type: int = MSG_COMMAND_1) -> tuple[int, bytes]:
+    return msg_type, payload
+
+
+def refresh_requests() -> list[tuple[int, bytes]]:
+    """Everything worth asking for after a connect, in display order."""
+    return [
+        req(bytes([FW_VERSION_REQUEST, 0x02])),
+        req(bytes([CODEC_GET, 0x00])),
+        req(bytes([BATTERY_GET, BATTERY_SINGLE])),
+        req(bytes([ASC_GET, 0x02])),
+        req(bytes([EQUALIZER_GET, 0x01])),
+        req(bytes([UPSAMPLING_GET, 0x02])),
+        req(bytes([APO_GET, APO_SUB_SPEAK_TO_CHAT])),
+        req(bytes([STC_CONFIG_GET, 0x05])),
+        req(bytes([APO_GET, APO_SUB_PAUSE_WHEN_TAKEN_OFF])),
+        req(bytes([APO_GET, APO_SUB_AUTO_POWER_OFF])),
+        req(bytes([TOUCH_GET, 0xD2])),
+        req(bytes([NC_OPTIMIZER_STATE_GET, 0x01])),
+        req(bytes([VOICE_NOTIFICATIONS_GET, 0x01, 0x01]), MSG_COMMAND_2),
+    ]
+
+
+def asc_request(mode: str, level: int, focus_on_voice: bool, supports_wind: bool) -> tuple[int, bytes]:
+    """Ambient sound control. One command carries mode, level and voice focus."""
+    if mode not in NC_MODES:
+        raise ValueError(f"unknown mode {mode!r}; expected one of {', '.join(NC_MODES)}")
+    if mode == "wind-noise-reduction" and not supports_wind:
+        raise ValueError("this device does not support wind noise reduction")
+
+    level = max(0, min(MAX_AMBIENT_LEVEL, int(level)))
+
+    payload = bytearray([ASC_SET, 0x02])
+    payload.append(0x00 if mode == "off" else 0x11)
+
+    if supports_wind:
+        payload.append(0x02)
+        payload.append(ASC_MODE_CODE.get(mode, 0x00))
+    else:
+        payload.append(0x00)
+        payload.append(ASC_MODE_CODE_NO_WIND.get(mode, 0x00))
+
+    payload.append(0x01)
+    payload.append(0x01 if focus_on_voice else 0x00)
+    # The level byte only carries meaning in ambient mode; NC reports zero.
+    payload.append(level if mode in ("off", "ambient-sound") else 0x00)
+
+    return req(bytes(payload))
+
+
+def eq_preset_request(preset: str) -> tuple[int, bytes]:
+    if preset not in EQ_PRESETS:
+        raise ValueError(f"unknown equalizer preset {preset!r}")
+    return req(bytes([EQUALIZER_SET, 0x01, EQ_PRESETS[preset], 0x00]))
+
+
+def eq_bands_request(bass: int, bands: list[int]) -> tuple[int, bytes]:
+    if len(bands) != 5:
+        raise ValueError("expected 5 equalizer bands")
+    values = [bass] + list(bands)
+    for value in values:
+        if value < -10 or value > 10:
+            raise ValueError("equalizer values must be between -10 and 10")
+    return req(bytes([EQUALIZER_SET, 0x01, 0xFF, 0x06] + [v + 10 for v in values]))
+
+
+def bool_request(opcode: int, sub: int, spacer: int, enabled: bool) -> tuple[int, bytes]:
+    return req(bytes([opcode, sub, spacer, 0x01 if enabled else 0x00]))
+
+
+def auto_power_off_request(value: str) -> tuple[int, bytes]:
+    if value not in AUTO_POWER_OFF:
+        raise ValueError(f"unknown auto power off value {value!r}")
+    c0, c1 = AUTO_POWER_OFF[value]
+    return req(bytes([APO_SET, APO_SUB_AUTO_POWER_OFF, 0x01, c0, c1]))
+
+
+def stc_config_request(sensitivity: str, focus_on_voice: bool, timeout: str) -> tuple[int, bytes]:
+    if sensitivity not in STC_SENSITIVITY:
+        raise ValueError(f"unknown speak-to-chat sensitivity {sensitivity!r}")
+    if timeout not in STC_TIMEOUT:
+        raise ValueError(f"unknown speak-to-chat timeout {timeout!r}")
+    return req(bytes([
+        STC_CONFIG_SET,
+        0x05,
+        0x00,
+        STC_SENSITIVITY[sensitivity],
+        0x01 if focus_on_voice else 0x00,
+        STC_TIMEOUT[timeout],
+    ]))
+
+
+# ---------------------------------------------------------------------------
+# Replies
+# ---------------------------------------------------------------------------
+
+
+def _bool(value: int):
+    return {0x00: False, 0x01: True}.get(value)
+
+
+def initial_state() -> dict:
+    return {
+        "connected": False,
+        "address": None,
+        "name": None,
+        "firmware": None,
+        "codec": None,
+        "battery": None,
+        "charging": None,
+        "nc_mode": None,
+        "ambient_level": None,
+        "focus_on_voice": None,
+        "supports_wind": None,
+        "eq_preset": None,
+        "eq_bass": None,
+        "eq_bands": None,
+        "dsee": None,
+        "speak_to_chat": None,
+        "stc_sensitivity": None,
+        "stc_focus_on_voice": None,
+        "stc_timeout": None,
+        "pause_when_taken_off": None,
+        "auto_power_off": None,
+        "touch_sensor": None,
+        "voice_notifications": None,
+        "nc_optimizer_pressure": None,
+        "features": sorted(ALL_FEATURES),
+        "error": None,
+    }
+
+
+def apply_payload(state: dict, msg_type: int, payload: bytes) -> bool:
+    """Fold one reply or notification into `state`. Returns True if anything moved.
+
+    Unknown or malformed payloads are ignored rather than raising: the
+    headphones emit plenty of chatter this plugin has no use for, and a widget
+    that dies on an unrecognised byte is worse than one that shrugs.
+    """
+    if not payload:
+        return False
+
+    before = dict(state)
+    code = payload[0]
+
+    if msg_type == MSG_COMMAND_2:
+        if code in (VOICE_NOTIFICATIONS_RET, VOICE_NOTIFICATIONS_NOTIFY) and len(payload) == 4:
+            state["voice_notifications"] = _bool(payload[3])
+        return state != before
+
+    if code == FW_VERSION_REPLY and len(payload) >= 4 and payload[1] == 0x02:
+        version = payload[3:].decode("ascii", "replace")
+        if re.fullmatch(r"[0-9.\-a-zA-Z_]+", version):
+            state["firmware"] = version
+
+    elif code in (CODEC_RET, CODEC_NOTIFY) and len(payload) == 3:
+        state["codec"] = AUDIO_CODECS.get(payload[2], f"0x{payload[2]:02x}")
+
+    elif code in (BATTERY_RET, BATTERY_NOTIFY) and len(payload) >= 4:
+        if payload[1] in (BATTERY_SINGLE, BATTERY_CASE):
+            state["battery"] = payload[2]
+            state["charging"] = payload[3] == 0x01
+
+    elif code in (ASC_RET, ASC_NOTIFY) and len(payload) == 8:
+        supports_wind = payload[3] == 0x02
+        table = ASC_MODE_FROM_CODE if supports_wind else ASC_MODE_FROM_CODE_NO_WIND
+        mode = "off" if payload[2] == 0x00 else table.get(payload[4])
+        level = payload[7]
+        if mode is not None and 0 <= level <= MAX_AMBIENT_LEVEL:
+            state["supports_wind"] = supports_wind
+            state["nc_mode"] = mode
+            state["ambient_level"] = level
+            state["focus_on_voice"] = _bool(payload[6])
+
+    elif code in (EQUALIZER_RET, EQUALIZER_NOTIFY) and len(payload) == 10:
+        preset = EQ_PRESET_FROM_CODE.get(payload[2])
+        if preset is not None:
+            state["eq_preset"] = preset
+            state["eq_bass"] = payload[4] - 10
+            state["eq_bands"] = [payload[5 + i] - 10 for i in range(5)]
+
+    elif code in (UPSAMPLING_RET, UPSAMPLING_NOTIFY) and len(payload) == 4:
+        # 0x01 is LDAC (inverted), 0x02 is DSEE Extreme.
+        if payload[1] == 0x02:
+            state["dsee"] = _bool(payload[3])
+
+    elif code in (APO_RET, APO_NOTIFY) and len(payload) >= 4:
+        sub = payload[1]
+        if sub == APO_SUB_AUTO_POWER_OFF and len(payload) == 5:
+            value = AUTO_POWER_OFF_FROM_CODE.get((payload[3], payload[4]))
+            if value is not None:
+                state["auto_power_off"] = value
+        elif sub == APO_SUB_PAUSE_WHEN_TAKEN_OFF and len(payload) == 4:
+            state["pause_when_taken_off"] = _bool(payload[3])
+        elif sub == APO_SUB_SPEAK_TO_CHAT and len(payload) == 4 and payload[2] in (0x00, 0x01):
+            # payload[2] says what this frame is about: a query answers with
+            # 0x00 and a write echoes 0x01, both carrying the on/off flag,
+            # while 0x02 reports something else entirely (a WH-1000XM4 emits
+            # `f9 05 02 00` right after being switched on) and must not be
+            # mistaken for the setting.
+            state["speak_to_chat"] = _bool(payload[3])
+
+    elif code in (STC_CONFIG_RET, STC_CONFIG_NOTIFY) and len(payload) == 6 and payload[1] == 0x05:
+        sensitivity = STC_SENSITIVITY_FROM_CODE.get(payload[3])
+        timeout = STC_TIMEOUT_FROM_CODE.get(payload[5])
+        if sensitivity is not None and timeout is not None:
+            state["stc_sensitivity"] = sensitivity
+            state["stc_focus_on_voice"] = _bool(payload[4])
+            state["stc_timeout"] = timeout
+
+    elif code in (TOUCH_RET, TOUCH_NOTIFY) and len(payload) == 4 and payload[1] == 0xD2:
+        state["touch_sensor"] = _bool(payload[3])
+
+    elif code in (NC_OPTIMIZER_STATE_RET, NC_OPTIMIZER_STATE_NOTIFY) and len(payload) == 6:
+        pressure = payload[5] / 10.0
+        if 0 < pressure <= 1.0:
+            state["nc_optimizer_pressure"] = pressure
+
+    return state != before
+
+
+# ---------------------------------------------------------------------------
+# SDP: which RFCOMM channel is the control service on?
+# ---------------------------------------------------------------------------
+#
+# BlueZ exposes no API for a remote device's service records and bluez-utils
+# dropped sdptool, so we ask the device ourselves over L2CAP. Guessing instead
+# is not an option: RFCOMM refuses every channel but the right one, and a
+# blocking connect to a closed channel takes seconds, so walking 1..30 costs
+# minutes and hammers the headphones on the way.
+
+SDP_PSM = 1
+SDP_SERVICE_SEARCH_ATTR_REQUEST = 0x06
+SDP_SERVICE_SEARCH_ATTR_RESPONSE = 0x07
+RFCOMM_PROTOCOL_UUID = 0x0003
+SERVICE_UUID_BYTES = bytes.fromhex(SERVICE_UUID.replace("-", ""))
+
+# The device decides how long this exchange runs and how much it sends, so both
+# are capped here rather than left to it. A real answer is a few hundred bytes
+# in one or two rounds; a peer that keeps handing back continuations — out of
+# malice or a fault — is cut off instead of held in memory and waited on.
+SDP_RECV_SIZE = 2048
+SDP_MAX_RECORD_BYTES = 8192   # aggregate attribute bytes across every round
+SDP_MAX_ROUNDS = 8            # request/response pairs, continuations included
+SDP_MAX_CONTINUATION = 16     # the spec caps continuation information at 16 bytes
+SDP_MAX_DEPTH = 16            # element nesting; a real record is three or four deep
+
+
+class SdpError(ValueError):
+    """The device's answer was malformed, oversized, or never finished."""
+
+
+def _de_sequence(body: bytes) -> bytes:
+    return bytes([(6 << 3) | 5, len(body)]) + body
+
+
+def _de_uuid128(raw: bytes) -> bytes:
+    return bytes([(3 << 3) | 4]) + raw
+
+
+def _de_uint32(value: int) -> bytes:
+    return bytes([(1 << 3) | 2]) + value.to_bytes(4, "big")
+
+
+def _parse_element(data: bytes, index: int, depth: int = 0):
+    """Decode one SDP data element. Sequences come back as lists, UUIDs as tuples.
+
+    Recursive, so nesting is capped: without that a record of a few thousand
+    bytes can be nothing but sequence headers and exhaust the stack.
+    """
+    if depth > SDP_MAX_DEPTH:
+        raise SdpError("the service record is nested too deeply")
+    header = data[index]
+    index += 1
+    element_type, size_index = header >> 3, header & 0x07
+
+    if size_index < 5:
+        length = (1, 2, 4, 8, 16)[size_index]
+        if element_type == 0:  # nil carries no bytes at all
+            return None, index
+    elif size_index == 5:
+        length = data[index]
+        index += 1
+    elif size_index == 6:
+        length = int.from_bytes(data[index:index + 2], "big")
+        index += 2
+    else:
+        length = int.from_bytes(data[index:index + 4], "big")
+        index += 4
+
+    end = index + length
+    if end > len(data):
+        raise SdpError("an element runs past the end of the service record")
+    body = data[index:end]
+
+    if element_type in (6, 7):
+        items = []
+        cursor = index
+        while cursor < end:
+            value, cursor = _parse_element(data, cursor, depth + 1)
+            items.append(value)
+        if cursor != end:
+            raise SdpError("an element runs past the end of its sequence")
+        return items, end
+    if element_type in (1, 2):
+        return int.from_bytes(body, "big"), end
+    if element_type == 3:
+        return ("uuid", int.from_bytes(body, "big")), end
+    if element_type == 5:
+        return bool(body[0]), end
+    return body, end
+
+
+def _find_rfcomm_channel(node):
+    """A protocol descriptor is [RFCOMM uuid, channel]; find the first one."""
+    if not isinstance(node, list):
+        return None
+    if (len(node) >= 2 and isinstance(node[0], tuple) and node[0][0] == "uuid"
+            and node[0][1] == RFCOMM_PROTOCOL_UUID and isinstance(node[1], int)):
+        return node[1]
+    for child in node:
+        found = _find_rfcomm_channel(child)
+        if found is not None:
+            return found
+    return None
+
+
+def sdp_query(sock, uuid: bytes, timeout: float, clock=time.monotonic) -> bytes:
+    """Run a service search on a connected SDP socket; return the record bytes.
+
+    The answer may arrive in pieces, each ending in a continuation state that
+    has to be sent back to get the next one. Everything about that loop is
+    the device's to decide, so all of it is bounded: the total record size,
+    the number of rounds, and the wall-clock time for the whole exchange —
+    not just each read, which a peer can satisfy forever by answering just in
+    time. A continuation must also make progress and never repeat; a peer
+    replaying one is going in circles, whatever the round count says.
+    """
+    deadline = clock() + timeout
+    record = bytearray()
+    continuation = b"\x00"
+    seen: set[bytes] = set()
+
+    def remaining() -> float:
+        left = deadline - clock()
+        if left <= 0:
+            raise SdpError("the device did not finish answering in time")
+        return left
+
+    for transaction in range(1, SDP_MAX_ROUNDS + 1):
+        params = (_de_sequence(_de_uuid128(uuid))
+                  + struct.pack(">H", 0xFFFF)
+                  + _de_sequence(_de_uint32(0x0000FFFF))
+                  + continuation)
+        sock.settimeout(remaining())
+        sock.send(struct.pack(">BHH", SDP_SERVICE_SEARCH_ATTR_REQUEST, transaction, len(params)) + params)
+        sock.settimeout(remaining())
+        response = sock.recv(SDP_RECV_SIZE)
+
+        if len(response) < 5:
+            raise SdpError("the response is shorter than its header")
+        pdu, answered, param_length = struct.unpack(">BHH", response[:5])
+        if pdu != SDP_SERVICE_SEARCH_ATTR_RESPONSE:
+            raise SdpError(f"unexpected SDP response 0x{pdu:02x}")
+        if answered != transaction:
+            raise SdpError("the response answers a different request")
+        body = response[5:5 + param_length]
+        if len(body) != param_length or len(body) < 2:
+            raise SdpError("the response is shorter than it declares")
+
+        count = int.from_bytes(body[:2], "big")
+        chunk = body[2:2 + count]
+        if len(chunk) != count:
+            raise SdpError("the attribute bytes run past the response")
+        if len(record) + count > SDP_MAX_RECORD_BYTES:
+            raise SdpError("the service record is larger than any real one")
+        record += chunk
+
+        # A missing continuation byte is off-spec but unambiguous: nothing
+        # follows. It was accepted before and costs nothing to keep accepting.
+        rest = body[2 + count:]
+        if not rest or rest[0] == 0:
+            return bytes(record)
+
+        if rest[0] > SDP_MAX_CONTINUATION or len(rest) != 1 + rest[0]:
+            raise SdpError("the continuation state is malformed")
+        if count == 0:
+            raise SdpError("a continuation arrived without any data")
+        if rest in seen:
+            raise SdpError("the device repeated a continuation state")
+        seen.add(rest)
+        continuation = rest
+
+    raise SdpError("the device kept asking for more rounds than any real record needs")
+
+
+def parse_sdp_record(record: bytes):
+    # Anything after the first element is ignored, as it always was: it costs
+    # nothing, and rejecting it would only risk a device that works today.
+    tree, _ = _parse_element(record, 0)
+    return tree
+
+
+def sdp_channel(address: str, uuid: bytes = SERVICE_UUID_BYTES, timeout: float = 8.0) -> int | None:
+    """Ask the device which RFCOMM channel carries `uuid`, or None.
+
+    `timeout` covers the whole lookup, connecting included.
+    """
+    deadline = time.monotonic() + timeout
+    sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((address, SDP_PSM))
+        record = sdp_query(sock, uuid, deadline - time.monotonic())
+        if not record:
+            return None
+        return _find_rfcomm_channel(parse_sdp_record(record))
+    except (OSError, SdpError, IndexError, struct.error):
+        return None
+    finally:
+        sock.close()
+
+# ---------------------------------------------------------------------------
+# Finding the headphones
+# ---------------------------------------------------------------------------
+
+CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "omarchy-sony-headphones",
+)
+
+MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$", re.IGNORECASE)
+
+
+# Where BlueZ actually installs bluetoothctl. The daemon is long-lived and
+# inherits whatever environment started the bar, so resolving the name through
+# PATH would let anything earlier on that PATH answer for it; the list is
+# searched once, at import, and the absolute result is what gets executed.
+BLUETOOTHCTL_CANDIDATES = ("/usr/bin/bluetoothctl", "/bin/bluetoothctl", "/usr/local/bin/bluetoothctl")
+
+# A minimal environment for the same reason. LC_ALL pins the locale because we
+# parse the output; PATH is present only because bluetoothctl expects one.
+BLUETOOTHCTL_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+
+
+def find_bluetoothctl() -> str | None:
+    for candidate in BLUETOOTHCTL_CANDIDATES:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+BLUETOOTHCTL = find_bluetoothctl()
+
+
+def bluetoothctl(*args: str, timeout: float = 5.0) -> str:
+    if BLUETOOTHCTL is None:
+        return ""
+    try:
+        done = subprocess.run(
+            [BLUETOOTHCTL, *args],
+            check=False, capture_output=True, text=True, timeout=timeout,
+            env=BLUETOOTHCTL_ENV,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return done.stdout
+
+
+def connected_devices() -> list[dict]:
+    """Connected Bluetooth devices that advertise Sony's app service."""
+    devices = []
+    for line in bluetoothctl("devices", "Connected").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2 or parts[0] != "Device" or not MAC_RE.match(parts[1]):
+            continue
+        address = parts[1]
+        name = parts[2].strip() if len(parts) > 2 else address
+        info = bluetoothctl("info", address)
+        if SERVICE_UUID in info.lower():
+            devices.append({"address": address, "name": name})
+    return devices
+
+
+def find_device(preferred: str | None = None) -> dict | None:
+    devices = connected_devices()
+    if preferred:
+        for device in devices:
+            if device["address"].lower() == preferred.lower():
+                return device
+        return None
+    return devices[0] if devices else None
+
+
+def _channel_cache_path(address: str) -> str:
+    return os.path.join(CACHE_DIR, address.replace(":", "").lower() + ".channel")
+
+
+def cached_channel(address: str) -> int | None:
+    try:
+        fd = os.open(_channel_cache_path(address), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as handle:
+            channel = int(handle.read(32).strip())
+    except (OSError, ValueError):
+        return None
+    return channel if 1 <= channel <= 30 else None
+
+
+def private_cache_dir() -> str | None:
+    """CACHE_DIR, made private, or nothing.
+
+    The cached channel decides where the next connection is dialled, so the
+    directory holding it should be no more reachable than the runtime one.
+    ~/.cache is normally the user's own, which is why this is a smaller matter
+    than the socket — but the directory may predate this check, or have been
+    left loose by whatever created it, so it is tightened rather than assumed.
+
+    A cache is an optimisation: anything that cannot be made private is
+    declined, and channel discovery simply runs again.
+    """
+    try:
+        os.mkdir(CACHE_DIR, 0o700)
+    except FileExistsError:
+        info = os.lstat(CACHE_DIR)
+        # Ours and a real directory, but looser than it should be: fix it.
+        # A symlink, or somebody else's, is not ours to correct.
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid():
+            if stat.S_IMODE(info.st_mode) != 0o700:
+                os.chmod(CACHE_DIR, 0o700)
+        else:
+            return None
+    except OSError:
+        return None
+    return CACHE_DIR if is_private_dir(CACHE_DIR) else None
+
+
+def remember_channel(address: str, channel: int) -> None:
+    try:
+        if private_cache_dir() is None:
+            return
+        path = _channel_cache_path(address)
+        # O_NOFOLLOW for the same reason as the lock: write the file we named,
+        # or nothing. O_TRUNC is fine here — the file is ours and its whole
+        # content is the number being replaced.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(str(channel))
+    except OSError:
+        pass
+
+
+def forget_channel(address: str) -> None:
+    try:
+        os.remove(_channel_cache_path(address))
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# The RFCOMM link
+# ---------------------------------------------------------------------------
+
+
+class NotConnected(Exception):
+    pass
+
+
+class Link:
+    """One RFCOMM conversation with a pair of headphones.
+
+    Sony's protocol is strictly lock-step: every message is answered with an
+    ACK carrying the flipped sequence number, and every message the headphones
+    send has to be acknowledged the same way. Miss an ACK and the device stops
+    talking, so the read loop below acknowledges first and interprets after.
+    """
+
+    ACK_TIMEOUT = 2.0
+    # Real headphones answer a write with a notification some time later; the
+    # stand-in device answers inside write() itself.
+    answers_immediately = False
+
+    def __init__(self, address: str, on_change=None):
+        self.address = address
+        self.on_change = on_change
+        self.state = initial_state()
+        self.state["address"] = address
+        self.sock: socket.socket | None = None
+        self.seq = 0
+        self._buffer = bytearray()
+        self._acked = False
+        self.last_rx = 0.0
+
+    # -- connection ---------------------------------------------------------
+
+    def _open(self, channel: int, timeout: float) -> socket.socket:
+        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+        # BlueZ's RFCOMM refuses a non-blocking connect outright, so connect
+        # blocking (BlueZ applies its own timeout) and only then arm the read
+        # timeout the rest of the conversation runs on.
+        sock.setblocking(True)
+        sock.connect((self.address, channel))
+        sock.settimeout(timeout)
+        return sock
+
+    def connect(self, timeout: float = 6.0) -> int:
+        """Open the link and complete the init handshake. Returns the channel.
+
+        The channel comes from the device's own SDP record; the last one that
+        worked is the fallback for the rare case where SDP is briefly
+        unavailable but the channel has not moved.
+        """
+        candidates = []
+        discovered = sdp_channel(self.address)
+        if discovered:
+            candidates.append(discovered)
+        known = cached_channel(self.address)
+        if known and known not in candidates:
+            candidates.append(known)
+
+        if not candidates:
+            raise NotConnected(
+                f"could not find Sony's control service on {self.address}; "
+                "is this a Sony device, and is it connected?"
+            )
+
+        last_error = None
+        for channel in candidates:
+            try:
+                sock = self._open(channel, timeout)
+            except OSError as exc:
+                last_error = exc
+                continue
+
+            self.sock = sock
+            self.seq = 0
+            self._buffer.clear()
+            try:
+                if self._handshake():
+                    remember_channel(self.address, channel)
+                    self.state["connected"] = True
+                    self.state["error"] = None
+                    return channel
+                last_error = "the device did not answer the init handshake"
+            except OSError as exc:
+                last_error = exc
+            self.close()
+
+        forget_channel(self.address)
+        raise NotConnected(
+            f"could not open Sony's control channel on {self.address}"
+            + (f": {last_error}" if last_error else "")
+        )
+
+    def _handshake(self) -> bool:
+        """Send INIT and wait for the device to identify itself.
+
+        A four-byte init reply means protocol v1, which is what this plugin
+        speaks. Eight bytes means v2 (WF-1000XM4, XM5, LinkBuds, CH720N…) —
+        a different command set entirely, so say so rather than send v1 bytes
+        at a device that will ignore them.
+
+        The headphones sometimes ignore the first INIT of a session, usually
+        just after a previous one closed, so ask again rather than declaring
+        the device silent. Repeated INITs are harmless: the device answers
+        every one of them.
+        """
+        for _ in range(3):
+            self.write(MSG_COMMAND_1, bytes([INIT_REQUEST, 0x00]), wait_ack=False)
+            deadline = time.monotonic() + self.ACK_TIMEOUT
+            while time.monotonic() < deadline:
+                frame = self._read_frame(deadline - time.monotonic())
+                if frame is None:
+                    break  # nothing more is coming in this window; ask again
+                msg_type, seq, payload = frame
+                if msg_type == MSG_ACK:
+                    self.seq = seq
+                    continue
+                self._ack(seq)
+                if payload and payload[0] == INIT_REPLY:
+                    if len(payload) == 4:
+                        return True
+                    raise NotConnected(
+                        "this device speaks Sony's v2 protocol, which this plugin "
+                        "does not implement yet (v1 devices only: WH-1000XM2/XM3/XM4)"
+                    )
+                self.dispatch(msg_type, payload)
+        return False
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+        self.state["connected"] = False
+
+    # -- framing ------------------------------------------------------------
+
+    def _read_frame(self, timeout: float):
+        """Read one complete frame, or None if the timeout expires first.
+
+        Markers cannot appear inside an escaped body, so a trailer byte always
+        ends a frame and a header byte always starts one.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            end = self._buffer.find(TRAILER)
+            if end != -1:
+                start = self._buffer.rfind(HEADER, 0, end)
+                raw = bytes(self._buffer[start:end + 1]) if start != -1 else None
+                del self._buffer[:end + 1]
+                if raw is None or len(raw) > MAX_MESSAGE_SIZE:
+                    continue
+                try:
+                    message = decode_message(raw)
+                except ProtocolError:
+                    continue
+                self.last_rx = time.monotonic()
+                return message
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or self.sock is None:
+                return None
+            self.sock.settimeout(remaining)
+            try:
+                chunk = self.sock.recv(1024)
+            except socket.timeout:
+                return None
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                raise
+            if not chunk:
+                raise NotConnected("the headphones closed the connection")
+            self._buffer.extend(chunk)
+            self._trim_buffer()
+
+    def _trim_buffer(self) -> None:
+        """Keep at most one frame's worth of bytes that have no trailer yet.
+
+        The buffer outlives each read, so a device that never sends a trailer
+        would otherwise grow it for as long as the link stays up. No real frame
+        is longer than MAX_MESSAGE_SIZE: past that, only a header close enough
+        to the end to still start a valid frame is worth keeping.
+        """
+        if len(self._buffer) <= MAX_MESSAGE_SIZE or TRAILER in self._buffer:
+            return
+        start = self._buffer.rfind(HEADER)
+        if start == -1 or len(self._buffer) - start > MAX_MESSAGE_SIZE:
+            self._buffer.clear()
+        else:
+            del self._buffer[:start]
+
+    def _ack(self, their_seq: int) -> None:
+        if self.sock is None:
+            return
+        self.sock.sendall(encode_message(MSG_ACK, 1 - their_seq, b""))
+
+    def write(self, msg_type: int, payload: bytes, wait_ack: bool = True) -> None:
+        if self.sock is None:
+            raise NotConnected("not connected")
+        self.sock.sendall(encode_message(msg_type, self.seq, payload))
+        if wait_ack:
+            self.wait_for_ack()
+
+    def wait_for_ack(self) -> bool:
+        deadline = time.monotonic() + self.ACK_TIMEOUT
+        while time.monotonic() < deadline:
+            frame = self._read_frame(deadline - time.monotonic())
+            if frame is None:
+                break
+            msg_type, seq, payload = frame
+            if msg_type == MSG_ACK:
+                self.seq = seq
+                return True
+            self._ack(seq)
+            self.dispatch(msg_type, payload)
+        return False
+
+    # -- conversation -------------------------------------------------------
+
+    def dispatch(self, msg_type: int, payload: bytes) -> None:
+        if apply_payload(self.state, msg_type, payload) and self.on_change:
+            self.on_change(self.state)
+
+    def pump(self, timeout: float) -> None:
+        """Read and process whatever the headphones have to say for a while."""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            frame = self._read_frame(remaining)
+            if frame is None:
+                return
+            msg_type, seq, payload = frame
+            if msg_type == MSG_ACK:
+                self.seq = seq
+                continue
+            self._ack(seq)
+            self.dispatch(msg_type, payload)
+
+    def request(self, requests: list[tuple[int, bytes]], settle: float = 0.25) -> None:
+        for msg_type, payload in requests:
+            self.write(msg_type, payload)
+        self.pump(settle)
+
+    def refresh(self) -> dict:
+        self.request(refresh_requests(), settle=0.6)
+        return self.state
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+BOOL_SETTINGS = {
+    # key: (opcode, sub-type, spacer byte, state key)
+    "dsee": (UPSAMPLING_SET, 0x02, 0x00, "dsee"),
+    "speak-to-chat": (APO_SET, APO_SUB_SPEAK_TO_CHAT, 0x01, "speak_to_chat"),
+    "pause-when-taken-off": (APO_SET, APO_SUB_PAUSE_WHEN_TAKEN_OFF, 0x00, "pause_when_taken_off"),
+    "touch-sensor": (TOUCH_SET, 0xD2, 0x01, "touch_sensor"),
+}
+
+SETTING_KEYS = sorted(list(BOOL_SETTINGS) + [
+    "nc", "ambient-level", "focus-on-voice", "eq", "eq-bands", "auto-power-off",
+    "stc-sensitivity", "stc-timeout", "stc-focus-on-voice", "voice-notifications",
+])
+
+
+def parse_bool(value, current=None) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("true", "on", "yes", "1", "enable", "enabled"):
+        return True
+    if text in ("false", "off", "no", "0", "disable", "disabled"):
+        return False
+    if text == "toggle":
+        return not bool(current)
+    raise ValueError(f"expected a boolean, got {value!r}")
+
+
+def next_nc_mode(current: str | None) -> str:
+    """Left-to-right cycle, the same one the headphone's own button walks."""
+    order = ["noise-cancelling", "ambient-sound", "off"]
+    if current not in order:
+        return order[0]
+    return order[(order.index(current) + 1) % len(order)]
+
+
+SETTING_FEATURES = {
+    "eq": "equalizer",
+    "eq-bands": "equalizer",
+    "dsee": "dsee",
+    "speak-to-chat": "speak-to-chat",
+    "stc-sensitivity": "speak-to-chat",
+    "stc-timeout": "speak-to-chat",
+    "stc-focus-on-voice": "speak-to-chat",
+    "pause-when-taken-off": "pause-when-taken-off",
+    "touch-sensor": "touch-sensor",
+    "voice-notifications": "voice-notifications",
+    "auto-power-off": "auto-power-off",
+}
+
+
+def setting_requests(state: dict, key: str, value) -> list[tuple[int, bytes]]:
+    """Turn one setting change into the requests that carry it."""
+    features = state.get("features") or sorted(ALL_FEATURES)
+    needed = SETTING_FEATURES.get(key)
+    if needed and needed not in features:
+        raise ValueError(f"{state.get('name') or 'this device'} does not support {key}")
+    if key == "auto-power-off" and str(value) not in ("off", "when-taken-off") \
+            and "auto-power-off-timer" not in features:
+        raise ValueError(
+            f"{state.get('name') or 'this device'} only supports auto power off "
+            "'off' or 'when-taken-off'"
+        )
+    supports_wind = state.get("supports_wind")
+    supports_wind = True if supports_wind is None else supports_wind
+    mode = state.get("nc_mode") or "off"
+    level = state.get("ambient_level")
+    level = MAX_AMBIENT_LEVEL if level is None else level
+    focus = bool(state.get("focus_on_voice"))
+
+    if key == "nc":
+        mode = next_nc_mode(mode) if str(value) == "cycle" else str(value)
+        return [asc_request(mode, level, focus, supports_wind)]
+
+    if key == "ambient-level":
+        level = int(value)
+        # Adjusting the slider is how you ask for ambient sound; jumping there
+        # matches what the phone app does and avoids a silent no-op in NC mode.
+        if mode not in ("ambient-sound", "off"):
+            mode = "ambient-sound"
+        return [asc_request(mode, level, focus, supports_wind)]
+
+    if key == "focus-on-voice":
+        return [asc_request(mode, level, parse_bool(value, focus), supports_wind)]
+
+    if key == "eq":
+        return [eq_preset_request(str(value))]
+
+    if key == "eq-bands":
+        numbers = [int(v) for v in re.split(r"[,\s]+", str(value).strip()) if v]
+        if len(numbers) != 6:
+            raise ValueError("eq-bands takes 6 values: clear-bass and 5 bands, each -10..10")
+        return [eq_bands_request(numbers[0], numbers[1:])]
+
+    if key == "auto-power-off":
+        return [auto_power_off_request(str(value))]
+
+    if key in ("stc-sensitivity", "stc-timeout", "stc-focus-on-voice"):
+        sensitivity = state.get("stc_sensitivity") or "auto"
+        timeout = state.get("stc_timeout") or "standard"
+        stc_focus = bool(state.get("stc_focus_on_voice"))
+        if key == "stc-sensitivity":
+            sensitivity = str(value)
+        elif key == "stc-timeout":
+            timeout = str(value)
+        else:
+            stc_focus = parse_bool(value, stc_focus)
+        return [stc_config_request(sensitivity, stc_focus, timeout)]
+
+    if key == "voice-notifications":
+        enabled = parse_bool(value, state.get("voice_notifications"))
+        return [req(bytes([VOICE_NOTIFICATIONS_SET, 0x01, 0x01, 0x01 if enabled else 0x00]), MSG_COMMAND_2)]
+
+    if key in BOOL_SETTINGS:
+        opcode, sub, spacer, state_key = BOOL_SETTINGS[key]
+        return [bool_request(opcode, sub, spacer, parse_bool(value, state.get(state_key)))]
+
+    raise ValueError(f"unknown setting {key!r}; expected one of {', '.join(SETTING_KEYS)}")
+
+
+SETTLE_TIMEOUT = 2.0
+
+
+def apply_setting(link: Link, key: str, value) -> dict:
+    requests = setting_requests(link.state, key, value)
+    before = dict(link.state)
+    for msg_type, payload in requests:
+        link.write(msg_type, payload)
+
+    # The headphones echo every change back as a notification, so wait for the
+    # echo rather than a fixed interval: it usually lands in milliseconds, but
+    # after a burst of writes a WH-1000XM4 can take the better part of a second,
+    # and returning before it arrives reports the old value as the new one.
+    deadline = time.monotonic() + (0 if link.answers_immediately else SETTLE_TIMEOUT)
+    while time.monotonic() < deadline:
+        link.pump(0.15)
+        if link.state != before:
+            break
+    return link.state
+
+
+# ---------------------------------------------------------------------------
+# A stand-in for the headphones
+# ---------------------------------------------------------------------------
+
+
+class DemoDevice:
+    """Answers requests the way a WH-1000XM4 does, without any Bluetooth.
+
+    It holds device-side values and replies with real reply payloads, so a
+    round trip through it exercises the encoders and the parsers against each
+    other. That makes it the test double for every setting, and the thing
+    behind `--demo`, which is how the panel gets looked at without hardware.
+    """
+
+    def __init__(self):
+        self.nc_on = True
+        self.mode = 0x02          # 0 ambient, 1 wind, 2 noise cancelling
+        self.focus_on_voice = False
+        self.level = 10
+        self.battery = 78
+        self.charging = False
+        self.eq_preset = 0x00
+        self.eq = [10] * 6        # clear bass and five bands, offset by ten
+        self.dsee = True
+        self.speak_to_chat = False
+        self.stc = [0x00, 0x00, 0x01]   # sensitivity, focus on voice, timeout
+        self.pause_when_taken_off = True
+        self.auto_power_off = (0x11, 0x00)
+        self.touch_sensor = True
+        self.voice_notifications = True
+
+    def asc(self) -> bytes:
+        return bytes([ASC_RET, 0x02, 0x01 if self.nc_on else 0x00, 0x02, self.mode,
+                      0x01, 0x01 if self.focus_on_voice else 0x00, self.level])
+
+    def equalizer(self) -> bytes:
+        return bytes([EQUALIZER_RET, 0x01, self.eq_preset, 0x06] + self.eq)
+
+    def respond(self, msg_type: int, payload: bytes) -> list[tuple[int, bytes]]:
+        """One request in, the replies a real device would send back out."""
+        if not payload:
+            return []
+        code, sub = payload[0], (payload[1] if len(payload) > 1 else 0)
+
+        if msg_type == MSG_COMMAND_2:
+            if code == VOICE_NOTIFICATIONS_SET:
+                self.voice_notifications = payload[3] == 0x01
+            if code in (VOICE_NOTIFICATIONS_GET, VOICE_NOTIFICATIONS_SET):
+                return [(MSG_COMMAND_2, bytes([VOICE_NOTIFICATIONS_RET, 0x01, 0x01,
+                                               0x01 if self.voice_notifications else 0x00]))]
+            return []
+
+        if code == INIT_REQUEST:
+            return [req(bytes([INIT_REPLY, 0x00, 0x40, 0x10]))]
+        if code == FW_VERSION_REQUEST:
+            version = b"2.5.0"
+            return [req(bytes([FW_VERSION_REPLY, 0x02, len(version)]) + version)]
+        if code == CODEC_GET:
+            return [req(bytes([CODEC_RET, 0x00, 0x10]))]
+        if code == BATTERY_GET:
+            return [req(bytes([BATTERY_RET, BATTERY_SINGLE, self.battery, 0x01 if self.charging else 0x00]))]
+        if code == NC_OPTIMIZER_STATE_GET:
+            return [req(bytes([NC_OPTIMIZER_STATE_RET, 0x01, 0x01, 0x01, 0x01, 0x0A]))]
+
+        if code == ASC_SET:
+            self.nc_on = payload[2] != 0x00
+            self.mode = payload[4]
+            self.focus_on_voice = payload[6] == 0x01
+            self.level = payload[7]
+        if code in (ASC_GET, ASC_SET):
+            return [req(self.asc())]
+
+        if code == EQUALIZER_SET:
+            if payload[2] == 0xFF:
+                self.eq = list(payload[4:10])
+                self.eq_preset = EQ_PRESETS["manual"]
+            else:
+                self.eq_preset = payload[2]
+        if code in (EQUALIZER_GET, EQUALIZER_SET):
+            return [req(self.equalizer())]
+
+        if code == UPSAMPLING_SET and sub == 0x02:
+            self.dsee = payload[3] == 0x01
+        if code in (UPSAMPLING_GET, UPSAMPLING_SET) and sub == 0x02:
+            return [req(bytes([UPSAMPLING_RET, 0x02, 0x00, 0x01 if self.dsee else 0x00]))]
+
+        if code in (APO_GET, APO_SET):
+            if sub == APO_SUB_SPEAK_TO_CHAT:
+                if code == APO_SET:
+                    self.speak_to_chat = payload[3] == 0x01
+                return [req(bytes([APO_RET, sub, 0x01, 0x01 if self.speak_to_chat else 0x00]))]
+            if sub == APO_SUB_PAUSE_WHEN_TAKEN_OFF:
+                if code == APO_SET:
+                    self.pause_when_taken_off = payload[3] == 0x01
+                return [req(bytes([APO_RET, sub, 0x00, 0x01 if self.pause_when_taken_off else 0x00]))]
+            if sub == APO_SUB_AUTO_POWER_OFF:
+                if code == APO_SET:
+                    self.auto_power_off = (payload[3], payload[4])
+                return [req(bytes([APO_RET, sub, 0x01, self.auto_power_off[0], self.auto_power_off[1]]))]
+            return []
+
+        if code == STC_CONFIG_SET:
+            self.stc = [payload[3], payload[4], payload[5]]
+        if code in (STC_CONFIG_GET, STC_CONFIG_SET):
+            return [req(bytes([STC_CONFIG_RET, 0x05, 0x00] + self.stc))]
+
+        if code in (TOUCH_GET, TOUCH_SET) and sub == 0xD2:
+            if code == TOUCH_SET:
+                self.touch_sensor = payload[3] == 0x01
+            return [req(bytes([TOUCH_RET, 0xD2, 0x01, 0x01 if self.touch_sensor else 0x00]))]
+
+        return []
+
+
+class DemoLink(Link):
+    """A Link whose other end is a DemoDevice instead of a radio."""
+
+    answers_immediately = True
+
+    def __init__(self, on_change=None):
+        super().__init__("00:00:00:00:00:00", on_change=on_change)
+        self.device = DemoDevice()
+        self.state["name"] = "WH-1000XM4 (demo)"
+        self.state["features"] = features_for("WH-1000XM4")
+        self.state["connected"] = True
+
+    def connect(self, timeout: float = 0.0) -> int:
+        return 0
+
+    def close(self) -> None:
+        self.state["connected"] = False
+
+    def write(self, msg_type: int, payload: bytes, wait_ack: bool = True) -> None:
+        # Round-trip through the wire format so the demo exercises the same
+        # framing the real device would, not a shortcut past it.
+        _, _, sent = decode_message(encode_message(msg_type, self.seq, payload))
+        self.seq = 1 - self.seq
+        for reply_type, reply in self.device.respond(msg_type, sent):
+            _, _, received = decode_message(encode_message(reply_type, self.seq, reply))
+            self.dispatch(reply_type, received)
+
+    def pump(self, timeout: float) -> None:
+        return
+
+
+# ---------------------------------------------------------------------------
+# The daemon
+# ---------------------------------------------------------------------------
+
+import select  # noqa: E402  (kept next to the daemon that needs it)
+
+
+SOCKET_NAME = "omarchy-sony-headphones.sock"
+LOCK_NAME = "omarchy-sony-headphones.lock"
+
+
+def is_private_dir(path: str, *, dir_fd: int | None = None) -> bool:
+    """True for a real directory that only this user can reach into.
+
+    lstat, not stat: a symlink pointing at a directory we do own must not pass
+    as one. Mode has to be exactly 0700 — group or other bits on the parent are
+    enough to let someone else create the socket name before we do.
+    """
+    try:
+        info = os.lstat(path) if dir_fd is None else os.lstat(path, dir_fd=dir_fd)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == os.getuid()
+        and stat.S_IMODE(info.st_mode) == 0o700
+    )
+
+
+def runtime_dir() -> str:
+    """The private directory holding the socket and the lock.
+
+    Anything that can write the socket can drive the headphones and read their
+    state, so its parent must be a directory nobody else can write. A correct
+    XDG_RUNTIME_DIR already is one by definition, but the variable is inherited
+    and can point anywhere, so it is checked rather than trusted.
+
+    Without a usable one we make our own and verify it the same way. The old
+    fallback was a bare /tmp/user-<uid>, which is a name an attacker on a
+    shared machine can create first — as a symlink, or as a directory of their
+    own — and then own every file we put in it.
+    """
+    supplied = os.environ.get("XDG_RUNTIME_DIR")
+    if supplied and is_private_dir(supplied):
+        return supplied
+
+    fallback = os.path.join(tempfile.gettempdir(), f"omarchy-sony-headphones-{os.getuid()}")
+    try:
+        os.mkdir(fallback, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise SystemExit(f"cannot create a private runtime directory at {fallback}: {exc}")
+
+    # Either we just made it, or it was already there — and something we did
+    # not make is only usable if it looks exactly like something we would have.
+    if not is_private_dir(fallback):
+        raise SystemExit(
+            f"{fallback} is not a private directory owned by this user; "
+            "set XDG_RUNTIME_DIR to a directory you own with mode 0700"
+        )
+    return fallback
+
+
+def socket_path() -> str:
+    return os.path.join(runtime_dir(), SOCKET_NAME)
+
+
+def lock_path() -> str:
+    return os.path.join(runtime_dir(), LOCK_NAME)
+
+
+# One JSON line on the control socket. State and requests are a few hundred
+# bytes; this is far above that and still small enough to hold without care.
+MAX_LINE_BYTES = 65536
+
+
+def emit(payload: dict) -> None:
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+
+class Daemon:
+    """Holds the RFCOMM link open and lends it out over a unix socket.
+
+    Opening RFCOMM costs the better part of a second and the headphones push
+    state on their own — press the button on the earcup and a notification
+    arrives — so the connection is worth keeping. Short-lived CLI calls talk to
+    this process instead of dialling the headphones themselves, and the bar
+    widget subscribes for a line of JSON per change.
+    """
+
+    POLL_INTERVAL = 60.0
+    REQUEST_TIMEOUT = 2.0
+    RETRY_MIN = 2.0
+    RETRY_MAX = 30.0
+
+    def __init__(self, preferred: str | None = None):
+        self.preferred = preferred
+        self.link: Link | None = None
+        self.subscribers: list[socket.socket] = []
+        self.retry_delay = self.RETRY_MIN
+        self.next_attempt = 0.0
+        self.next_poll = 0.0
+        self.last_emitted: dict | None = None
+        self._lock = None
+        self._socket_path = None
+
+    # -- state out ----------------------------------------------------------
+
+    def state(self) -> dict:
+        if self.link is not None:
+            return self.link.state
+        disconnected = initial_state()
+        disconnected["address"] = self.preferred
+        return disconnected
+
+    def publish(self, state: dict | None = None) -> None:
+        state = dict(state if state is not None else self.state())
+        if state == self.last_emitted:
+            return
+        self.last_emitted = state
+        line = json.dumps(state) + "\n"
+        emit(state)
+        for client in list(self.subscribers):
+            try:
+                client.sendall(line.encode())
+            except OSError:
+                self.drop(client)
+
+    def drop(self, client: socket.socket) -> None:
+        if client in self.subscribers:
+            self.subscribers.remove(client)
+        try:
+            client.close()
+        except OSError:
+            pass
+
+    # -- device -------------------------------------------------------------
+
+    def try_connect(self) -> None:
+        self.next_attempt = time.monotonic() + self.retry_delay
+        if demo_mode():
+            self.link = DemoLink(on_change=self.publish)
+            self.link.refresh()
+            self.publish()
+            return
+        device = find_device(self.preferred)
+        if device is None:
+            self.publish()
+            return
+
+        link = Link(device["address"], on_change=self.publish)
+        link.state["name"] = device["name"]
+        link.state["features"] = features_for(device["name"])
+        try:
+            link.connect()
+            link.refresh()
+        except (NotConnected, OSError) as exc:
+            link.close()
+            state = initial_state()
+            state["address"] = device["address"]
+            state["name"] = device["name"]
+            state["error"] = str(exc)
+            self.publish(state)
+            self.retry_delay = min(self.RETRY_MAX, self.retry_delay * 2)
+            return
+
+        self.link = link
+        self.retry_delay = self.RETRY_MIN
+        self.next_poll = time.monotonic() + self.POLL_INTERVAL
+        self.publish()
+
+    def lose_link(self, reason: str = "") -> None:
+        if self.link is not None:
+            self.link.close()
+        self.link = None
+        state = initial_state()
+        state["address"] = self.preferred
+        state["error"] = reason or None
+        self.next_attempt = time.monotonic() + self.retry_delay
+        self.publish(state)
+
+    # -- clients ------------------------------------------------------------
+
+    def with_link(self, action):
+        """Run a device action, reconnecting once if the link has gone stale.
+
+        The headphones drop the control session on their own after a while, and
+        nothing says so until the next write, so a command that arrives on a
+        dead link should repair it rather than report failure at the user.
+        """
+        for attempt in (1, 2):
+            if self.link is None:
+                self.try_connect()
+            if self.link is None:
+                raise NotConnected("headphones not connected")
+            try:
+                return action(self.link)
+            except (NotConnected, OSError) as exc:
+                self.lose_link(str(exc))
+                if attempt == 2:
+                    raise
+
+    def handle_command(self, request: dict) -> dict:
+        command = str(request.get("cmd", "status"))
+
+        if command in ("status", "ping"):
+            return {"ok": True, "state": self.state()}
+
+        actions = {
+            "set": lambda link: apply_setting(link, str(request.get("key", "")), request.get("value")),
+            "cycle": lambda link: apply_setting(link, "nc", "cycle"),
+            "refresh": lambda link: link.refresh(),
+            "power-off": lambda link: link.write(MSG_COMMAND_1, bytes([POWER_OFF, 0x00])),
+        }
+        action = actions.get(command)
+        if action is None:
+            return {"ok": False, "error": f"unknown command {command!r}", "state": self.state()}
+
+        try:
+            self.with_link(action)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "state": self.state()}
+        except (NotConnected, OSError) as exc:
+            return {"ok": False, "error": str(exc), "state": self.state()}
+        return {"ok": True, "state": self.state()}
+
+    def accept(self, listener: socket.socket) -> None:
+        try:
+            client, _ = listener.accept()
+        except OSError:
+            return
+        # The daemon serves one client at a time, so the deadline covers the
+        # whole request: a per-read timeout alone lets a client trickle a byte
+        # at a time and hold everything else up for as long as it likes.
+        deadline = time.monotonic() + self.REQUEST_TIMEOUT
+        try:
+            data = b""
+            while b"\n" not in data and len(data) < MAX_LINE_BYTES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("the request took too long to arrive")
+                client.settimeout(remaining)
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            request = json.loads(data.decode() or "{}")
+        except (OSError, ValueError):
+            self.drop(client)
+            return
+
+        if str(request.get("cmd", "")) == "subscribe":
+            try:
+                client.settimeout(None)
+                client.sendall((json.dumps(self.state()) + "\n").encode())
+            except OSError:
+                self.drop(client)
+                return
+            self.subscribers.append(client)
+            return
+
+        response = self.handle_command(request)
+        try:
+            client.sendall((json.dumps(response) + "\n").encode())
+        except OSError:
+            pass
+        self.drop(client)
+
+    # -- main loop ----------------------------------------------------------
+
+    def listen(self) -> socket.socket:
+        """Claim the daemon role, or refuse to start.
+
+        Only one process may hold the Bluetooth link — a second one racing for
+        it is how the headphones end up dropping the session — so election runs
+        through an exclusive lock rather than the socket file, which two
+        processes can both decide is stale and both replace.
+        """
+        directory = runtime_dir()
+        self._socket_path = os.path.join(directory, SOCKET_NAME)
+        # Both files are opened relative to a descriptor for the directory that
+        # was just verified private, so that is the directory they land in
+        # whatever the path resolves to by the time we get there.
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            self._lock = self.claim_lock(dir_fd)
+            listener = self.bind_socket(dir_fd)
+        finally:
+            os.close(dir_fd)
+        listener.listen(8)
+        return listener
+
+    def claim_lock(self, dir_fd: int):
+        """Open the lock file and take it, or refuse to start."""
+        # O_NOFOLLOW: a symlink parked under the name is an error, not a write
+        # somewhere else. And no truncation — the lock holds nothing worth
+        # clearing, and truncating on open is how a file that turns out to
+        # belong to someone else gets damaged before we ever look at it.
+        fd = os.open(
+            LOCK_NAME,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=dir_fd,
+        )
+        lock = os.fdopen(fd, "r+")
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            lock.close()
+            raise SystemExit(f"{LOCK_NAME} is not a regular file owned by this user")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock.close()
+            raise SystemExit("another sony-headphones daemon is already running")
+        return lock
+
+    def bind_socket(self, dir_fd: int) -> socket.socket:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        # umask rather than a chmod afterwards: bind then creates the socket
+        # already unreachable to anyone else, with no window in between.
+        previous = os.umask(0o177)
+        try:
+            try:
+                listener.bind(self._socket_path)
+            except OSError as exc:
+                if exc.errno != errno.EADDRINUSE:
+                    raise
+                self.remove_stale_socket(dir_fd)
+                listener.bind(self._socket_path)
+        finally:
+            os.umask(previous)
+        return listener
+
+    def remove_stale_socket(self, dir_fd: int) -> None:
+        """Clear a socket left behind by a dead daemon — and nothing else.
+
+        We hold the lock, so anything still on disk under our name is from a
+        process that is gone. That reasoning only holds for a socket we own,
+        though: unlinking whatever happens to be sitting there is how someone
+        else's file, or a symlink to one, becomes ours to delete.
+        """
+        try:
+            info = os.lstat(SOCKET_NAME, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            raise SystemExit(
+                f"refusing to replace {SOCKET_NAME}: it is not a socket owned by this user"
+            )
+        os.unlink(SOCKET_NAME, dir_fd=dir_fd)
+
+    def run(self) -> None:
+        listener = self.listen()
+        try:
+            while True:
+                now = time.monotonic()
+                if self.link is None and now >= self.next_attempt:
+                    self.try_connect()
+
+                watched = [listener] + self.subscribers
+                if self.link is not None and self.link.sock is not None:
+                    watched.append(self.link.sock)
+
+                try:
+                    readable, _, _ = select.select(watched, [], [], 1.0)
+                except (OSError, ValueError):
+                    readable = []
+
+                for sock in readable:
+                    if sock is listener:
+                        self.accept(listener)
+                    elif sock in self.subscribers:
+                        # Subscribers never speak; anything readable is EOF.
+                        self.drop(sock)
+                    elif self.link is not None and sock is self.link.sock:
+                        try:
+                            self.link.pump(0.05)
+                        except (NotConnected, OSError) as exc:
+                            self.lose_link(str(exc))
+
+                if self.link is not None and not demo_mode() and time.monotonic() >= self.next_poll:
+                    self.next_poll = time.monotonic() + self.POLL_INTERVAL
+                    heard = self.link.last_rx
+                    try:
+                        self.link.request([req(bytes([BATTERY_GET, BATTERY_SINGLE]))], settle=1.0)
+                    except (NotConnected, OSError) as exc:
+                        self.lose_link(str(exc))
+                    else:
+                        # The socket can stay open long after the headphones
+                        # have stopped listening, so silence in answer to a
+                        # question is the only reliable sign the link is gone.
+                        if self.link is not None and self.link.last_rx == heard:
+                            self.lose_link("the headphones stopped answering")
+        finally:
+            if self.link is not None:
+                self.link.close()
+            listener.close()
+            try:
+                os.unlink(self._socket_path)
+            except OSError:
+                pass
+            if self._lock is not None:
+                self._lock.close()
+
+
+# ---------------------------------------------------------------------------
+# Talking to the daemon
+# ---------------------------------------------------------------------------
+
+
+def daemon_socket(timeout: float = 5.0) -> socket.socket | None:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(socket_path())
+    except OSError:
+        sock.close()
+        return None
+    return sock
+
+
+def daemon_alive() -> bool:
+    sock = daemon_socket(timeout=1.0)
+    if sock is None:
+        return False
+    sock.close()
+    return True
+
+
+def ask_daemon(request: dict, timeout: float = 10.0) -> dict | None:
+    sock = daemon_socket(timeout)
+    if sock is None:
+        return None
+    deadline = time.monotonic() + timeout
+    try:
+        sock.sendall((json.dumps(request) + "\n").encode())
+        data = b""
+        while b"\n" not in data:
+            if len(data) > MAX_LINE_BYTES:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            sock.settimeout(remaining)
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return json.loads(data.decode())
+    except (OSError, ValueError):
+        return None
+    finally:
+        sock.close()
+
+
+def demo_mode() -> bool:
+    return os.environ.get("SONY_HEADPHONES_DEMO", "") not in ("", "0")
+
+
+def direct(request: dict, preferred: str | None) -> dict:
+    """Do it ourselves, for when no daemon is running."""
+    if demo_mode():
+        link = DemoLink()
+        link.refresh()
+        command = str(request.get("cmd", "status"))
+        if command == "set":
+            apply_setting(link, str(request.get("key", "")), request.get("value"))
+        elif command == "cycle":
+            apply_setting(link, "nc", "cycle")
+        return {"ok": True, "state": link.state}
+
+    device = find_device(preferred)
+    if device is None:
+        state = initial_state()
+        state["address"] = preferred
+        state["error"] = "no connected Sony headphones found"
+        return {"ok": False, "error": state["error"], "state": state}
+
+    link = Link(device["address"])
+    link.state["name"] = device["name"]
+    link.state["features"] = features_for(device["name"])
+    try:
+        link.connect()
+        link.refresh()
+        command = str(request.get("cmd", "status"))
+        if command == "set":
+            apply_setting(link, str(request.get("key", "")), request.get("value"))
+        elif command == "cycle":
+            apply_setting(link, "nc", "cycle")
+        elif command == "power-off":
+            link.write(MSG_COMMAND_1, bytes([POWER_OFF, 0x00]))
+        # sony-headphones-tray: a copy, since close() below marks link.state disconnected
+        return {"ok": True, "state": dict(link.state)}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "state": link.state}
+    except (NotConnected, OSError) as exc:
+        state = link.state
+        state["error"] = str(exc)
+        return {"ok": False, "error": str(exc), "state": state}
+    finally:
+        link.close()
+
+
+def run_request(request: dict, preferred: str | None) -> dict:
+    response = ask_daemon(request)
+    if response is None:
+        response = direct(request, preferred)
+    return response
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def describe(state: dict) -> str:
+    if not state.get("connected"):
+        return state.get("error") or "Headphones not connected"
+
+    lines = [f"{state.get('name') or state.get('address')}"]
+
+    def add(label, value):
+        if value is not None:
+            lines.append(f"  {label:<22}{value}")
+
+    battery = state.get("battery")
+    if battery is not None:
+        add("Battery", f"{battery}%" + (" (charging)" if state.get("charging") else ""))
+    add("Firmware", state.get("firmware"))
+    add("Codec", state.get("codec"))
+    add("Mode", state.get("nc_mode"))
+    if state.get("nc_mode") in ("ambient-sound", "off"):
+        add("Ambient level", f"{state.get('ambient_level')}/{MAX_AMBIENT_LEVEL}")
+        add("Focus on voice", state.get("focus_on_voice"))
+    add("Equalizer", state.get("eq_preset"))
+    if state.get("eq_bands") is not None:
+        add("Bands", f"bass {state.get('eq_bass')}, " + " ".join(str(b) for b in state["eq_bands"]))
+    add("DSEE Extreme", state.get("dsee"))
+    add("Speak-to-Chat", state.get("speak_to_chat"))
+    if state.get("speak_to_chat"):
+        add("  sensitivity", state.get("stc_sensitivity"))
+        add("  timeout", state.get("stc_timeout"))
+        add("  focus on voice", state.get("stc_focus_on_voice"))
+    add("Pause when taken off", state.get("pause_when_taken_off"))
+    add("Auto power off", state.get("auto_power_off"))
+    add("Touch sensor", state.get("touch_sensor"))
+    add("Voice guidance", state.get("voice_notifications"))
+    add("NC optimizer", state.get("nc_optimizer_pressure") and f"{state['nc_optimizer_pressure']:.1f} atm")
+    return "\n".join(lines)
+
+
+def cmd_watch(args) -> int:
+    """Stream state changes as JSON lines, one object per line.
+
+    Becomes the daemon if none is running, and otherwise subscribes to the one
+    that is, so several bar widgets can watch the same headphones.
+    """
+    sock = daemon_socket(timeout=5.0)
+    if sock is not None:
+        try:
+            sock.sendall((json.dumps({"cmd": "subscribe"}) + "\n").encode())
+            sock.settimeout(None)
+            buffered = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    return 0
+                buffered += chunk
+                while b"\n" in buffered:
+                    line, buffered = buffered.split(b"\n", 1)
+                    if line.strip():
+                        sys.stdout.write(line.decode() + "\n")
+                        sys.stdout.flush()
+                # The widget restarts a watcher that exits, so giving up on a
+                # line that never ends is safe and better than holding it.
+                if len(buffered) > MAX_LINE_BYTES:
+                    return 1
+        except (OSError, KeyboardInterrupt):
+            return 0
+        finally:
+            sock.close()
+
+    try:
+        Daemon(args.address).run()
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+def cmd_status(args) -> int:
+    response = run_request({"cmd": "status"}, args.address)
+    state = response.get("state", initial_state())
+    if args.json:
+        emit(state)
+    else:
+        print(describe(state))
+    return 0 if state.get("connected") else 1
+
+
+def cmd_set(args) -> int:
+    response = run_request({"cmd": "set", "key": args.key, "value": args.value}, args.address)
+    return _report(response, args)
+
+
+def cmd_cycle(args) -> int:
+    response = run_request({"cmd": "cycle"}, args.address)
+    return _report(response, args)
+
+
+def cmd_power_off(args) -> int:
+    return _report(run_request({"cmd": "power-off"}, args.address), args)
+
+
+def _report(response: dict, args) -> int:
+    state = response.get("state", initial_state())
+    if args.json:
+        emit(state)
+    elif response.get("ok"):
+        print(describe(state))
+    else:
+        print(response.get("error", "failed"), file=sys.stderr)
+    return 0 if response.get("ok") else 1
+
+
+def cmd_probe(args) -> int:
+    """Diagnostics worth pasting into a bug report."""
+    print(f"bluetoothctl:      {'found' if bluetoothctl('--version') else 'MISSING'}")
+    devices = connected_devices()
+    if not devices:
+        print("Sony devices:      none connected")
+        print("\nPair and connect the headphones first, then run this again.")
+        return 1
+    for device in devices:
+        print(f"Sony device:       {device['name']} [{device['address']}]")
+        print(f"  cached channel:  {cached_channel(device['address']) or '-'}")
+
+    device = find_device(args.address) or devices[0]
+    link = Link(device["address"])
+    link.state["name"] = device["name"]
+    link.state["features"] = features_for(device["name"])
+    started = time.monotonic()
+    try:
+        channel = link.connect()
+    except (NotConnected, OSError) as exc:
+        print(f"  connect:         FAILED ({exc})")
+        return 1
+    print(f"  connect:         ok on RFCOMM channel {channel} in {time.monotonic() - started:.2f}s")
+    try:
+        link.refresh()
+        print()
+        print(describe(link.state))
+    finally:
+        link.close()
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sony-headphones",
+        description="Control Sony headphones (protocol v1: WH-1000XM2/XM3/XM4) over Bluetooth.",
+    )
+    parser.add_argument("--address", help="Bluetooth MAC to use, if several are connected")
+    parser.add_argument("--json", action="store_true", help="print the device state as JSON")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("status", help="show the current state").set_defaults(func=cmd_status)
+    sub.add_parser("watch", help="stream state changes as JSON lines").set_defaults(func=cmd_watch)
+    sub.add_parser("cycle", help="cycle noise cancelling / ambient / off").set_defaults(func=cmd_cycle)
+    sub.add_parser("probe", help="diagnose the connection").set_defaults(func=cmd_probe)
+    sub.add_parser("power-off", help="turn the headphones off").set_defaults(func=cmd_power_off)
+
+    setter = sub.add_parser("set", help="change one setting")
+    setter.add_argument("key", choices=SETTING_KEYS, metavar="KEY", help=", ".join(SETTING_KEYS))
+    setter.add_argument("value")
+    setter.set_defaults(func=cmd_set)
+
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        args = parser.parse_args(["status", *argv])
+    try:
+        return args.func(args)
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

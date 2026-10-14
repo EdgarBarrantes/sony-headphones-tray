@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Sony headphones tray
+Comment=Noise cancelling, ambient sound, Speak-to-Chat, EQ and battery for Sony WH-1000XM2/XM3/XM4
+Exec=@EXEC@
+Icon=audio-headphones
+Categories=AudioVideo;Audio;
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
